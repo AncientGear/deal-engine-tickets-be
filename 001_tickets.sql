@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS tickets (
+ id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+ passenger VARCHAR(200) NOT NULL,
+ flight VARCHAR(30) NOT NULL,
+ origin VARCHAR(100) NOT NULL,
+ destination VARCHAR(100) NOT NULL,
+ departure TIMESTAMPTZ NOT NULL,
+ status VARCHAR(20) NOT NULL DEFAULT 'booked' CHECK (status IN ('booked','cancelled'))
+);

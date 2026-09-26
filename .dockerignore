@@ -1,0 +1,9 @@
+.git
+.atl
+.env
+.env.*
+!.env.example
+*.log
+coverage*
+bin/
+dist/

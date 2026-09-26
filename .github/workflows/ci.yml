@@ -64,3 +64,60 @@ jobs:
             --platform linux/amd64 \
             --tag deal-engine-backend:ci \
             .
+      - name: Prepare application database
+        env:
+          PGPASSWORD: ci-test-only
+        run: |
+          psql \
+            -h 127.0.0.1 \
+            -U test \
+            -d tickets_test \
+            -v ON_ERROR_STOP=1 \
+            -f 002_admin.sql
+      - name: Start application container
+        run: |
+          docker run -d \
+            --name backend-smoke \
+            --network host \
+            -e LISTEN_ADDR=127.0.0.1:8080 \
+            -e DATABASE_URL='postgres://test:ci-test-only@127.0.0.1:5432/tickets_test?sslmode=disable' \
+            -e TOKEN_SECRET='ci-only-secret-not-for-production-32-bytes' \
+            -e ENABLE_LOCAL_SETUP=false \
+            deal-engine-backend:ci
+      - name: Check application health
+        run: |
+          ready=false
+
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent --show-error \
+              --connect-timeout 1 \
+              --max-time 2 \
+              http://127.0.0.1:8080/readyz; then
+              ready=true
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ "$ready" != true ]; then
+            echo "Backend did not become ready within the retry budget."
+            exit 1
+          fi
+
+          curl --fail --silent --show-error \
+            --max-time 2 \
+            http://127.0.0.1:8080/healthz
+      - name: Show container logs
+        if: always()
+        run: |
+          if docker container inspect backend-smoke >/dev/null 2>&1; then
+            docker logs backend-smoke
+          fi
+
+      - name: Remove application container
+        if: always()
+        run: |
+          if docker container inspect backend-smoke >/dev/null 2>&1; then
+            docker rm -f backend-smoke
+          fi

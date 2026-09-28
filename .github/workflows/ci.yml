@@ -123,6 +123,24 @@ jobs:
           if docker container inspect backend-smoke >/dev/null 2>&1; then
             docker rm -f backend-smoke
           fi
+      - name: Inspect OIDC identity claims
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const token = await core.getIDToken('sts.amazonaws.com');
+            const claims = JSON.parse(
+              Buffer.from(token.split('.')[1], 'base64url').toString('utf8')
+            );
+
+            core.info(JSON.stringify({
+              iss: claims.iss,
+              aud: claims.aud,
+              sub: claims.sub,
+              repository: claims.repository,
+              ref: claims.ref,
+              environment: claims.environment
+            }, null, 2));
       - name: Configure AWS credentials
         if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
         uses: aws-actions/configure-aws-credentials@v4

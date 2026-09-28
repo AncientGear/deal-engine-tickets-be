@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   test-and-build:
@@ -122,3 +123,14 @@ jobs:
           if docker container inspect backend-smoke >/dev/null 2>&1; then
             docker rm -f backend-smoke
           fi
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::989200477899:role/dealengine-dev-github-ecr-publisher
+          aws-region: us-east-2
+          role-session-name: backend-ci-${{ github.run_id }}
+
+      - name: Verify AWS identity
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        run: aws sts get-caller-identity

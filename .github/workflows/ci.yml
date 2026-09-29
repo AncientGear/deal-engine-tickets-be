@@ -8,7 +8,6 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   test-and-build:
@@ -123,32 +122,36 @@ jobs:
           if docker container inspect backend-smoke >/dev/null 2>&1; then
             docker rm -f backend-smoke
           fi
-      - name: Inspect OIDC identity claims
+      - name: Export tested image
         if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
-        uses: actions/github-script@v8
-        with:
-          script: |
-            const token = await core.getIDToken('sts.amazonaws.com');
-            const claims = JSON.parse(
-              Buffer.from(token.split('.')[1], 'base64url').toString('utf8')
-            );
+        run: |
+          docker save \
+            --output "${RUNNER_TEMP}/backend-image.tar" \
+            deal-engine-backend:ci
 
-            core.info(JSON.stringify({
-              iss: claims.iss,
-              aud: claims.aud,
-              sub: claims.sub,
-              repository: claims.repository,
-              ref: claims.ref,
-              environment: claims.environment
-            }, null, 2));
-      - name: Configure AWS credentials
+      - name: Upload tested image
         if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: actions/upload-artifact@v4
         with:
-          role-to-assume: arn:aws:iam::989200477899:role/dealengine-dev-github-ecr-publisher
-          aws-region: us-east-2
-          role-session-name: backend-ci-${{ github.run_id }}
+          name: backend-image-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/backend-image.tar
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+  publish-dev:
+       needs: test-and-build
+       if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
 
-      - name: Verify AWS identity
-        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
-        run: aws sts get-caller-identity
+       permissions:
+         contents: read
+         actions: read
+         id-token: write
+
+       uses: ./.github/workflows/publish-ecr.yml
+
+       with:
+         role-arn: arn:aws:iam::989200477899:role/dealengine-dev-github-ecr-publisher
+         aws-region: us-east-2
+         repository: dev-dealengine-ecr-repo
+         artifact-name: backend-image-${{ github.sha }}-${{ github.run_attempt }}
+         image-tag: run-${{ github.run_id }}-${{ github.run_attempt }}

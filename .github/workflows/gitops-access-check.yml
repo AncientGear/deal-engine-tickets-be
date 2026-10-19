@@ -1,0 +1,35 @@
+name: Check GitOps App access
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Create read-only installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: AncientGear
+          repositories: dealengine-argo-ops
+          permission-contents: read
+
+      - name: Verify GitOps file access
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh api \
+            repos/AncientGear/dealengine-argo-ops/contents/environments/dev/values.yaml \
+            -f ref=main \
+            --method GET \
+            --jq '{path: .path, sha: .sha}'
+
+          printf '%s\n' 'GitOps read access verified.'

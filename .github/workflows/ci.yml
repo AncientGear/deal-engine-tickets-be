@@ -31,7 +31,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+      - name: Install GitOps tooling dependency
+        run: python3 -m pip install PyYAML==6.0.3
 
+      - name: Test GitOps digest tooling
+        run: |
+          python3 scripts/tests/test_select_image_digest.py -v
+          python3 scripts/tests/test_update_dev_digest.py -v
+          python3 scripts/tests/test_propose_dev.py -v
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -155,3 +162,127 @@ jobs:
          repository: dev-dealengine-ecr-repo
          artifact-name: backend-image-${{ github.sha }}-${{ github.run_attempt }}
          image-tag: ${{ github.run_id }}-${{ github.run_attempt }}
+
+  propose-dev:
+       needs: publish-dev
+       if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+       runs-on: ubuntu-24.04
+
+       permissions:
+         contents: read
+
+       concurrency:
+         group: backend-gitops-dev
+         cancel-in-progress: false
+
+       steps:
+         - name: Checkout promotion tooling
+           uses: actions/checkout@v5
+           with:
+             path: automation
+             persist-credentials: false
+
+         - name: Install GitOps tooling dependency
+           run: python3 -m pip install PyYAML==6.0.3
+
+         - name: Test GitOps digest tooling
+           run: |
+             python3 automation/scripts/tests/test_select_image_digest.py -v
+             python3 automation/scripts/tests/test_update_dev_digest.py -v
+             python3 automation/scripts/tests/test_propose_dev.py -v
+
+         - name: Validate published digest
+           env:
+             IMAGE_DIGEST: ${{ needs.publish-dev.outputs.image-digest }}
+           run: |
+             if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+               printf '%s\n' 'Missing or invalid published image digest.' >&2
+               exit 1
+             fi
+
+         - name: Create GitOps installation token
+           id: app-token
+           uses: actions/create-github-app-token@v2
+           with:
+             app-id: ${{ vars.GITOPS_APP_ID }}
+             private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+             owner: AncientGear
+             repositories: dealengine-argo-ops
+             permission-contents: write
+             permission-pull-requests: write
+
+         - name: Checkout GitOps main
+           uses: actions/checkout@v5
+           with:
+             repository: AncientGear/dealengine-argo-ops
+             ref: main
+             path: gitops
+             token: ${{ steps.app-token.outputs.token }}
+             persist-credentials: false
+
+         - name: Update dev digest locally
+           env:
+             IMAGE_DIGEST: ${{ needs.publish-dev.outputs.image-digest }}
+           run: |
+             python3 automation/scripts/update_dev_digest.py \
+               gitops/environments/dev/values.yaml \
+               "$IMAGE_DIGEST"
+
+         - name: Propose dev deployment
+           env:
+             GH_TOKEN: ${{ steps.app-token.outputs.token }}
+             IMAGE_DIGEST: ${{ needs.publish-dev.outputs.image-digest }}
+           run: |
+             set -euo pipefail
+
+             if git -C gitops diff --quiet; then
+               printf '%s\n' 'Digest already selected; no PR required.'
+               exit 0
+             fi
+
+             changed="$(git -C gitops diff --name-only)"
+             if [[ "$changed" != "environments/dev/values.yaml" ]]; then
+               printf '%s\n' 'Unexpected GitOps changes; proposal aborted.' >&2
+               exit 1
+             fi
+
+             repository="AncientGear/dealengine-argo-ops"
+             branch="automation/dev-image/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+             base_sha="$(git -C gitops rev-parse HEAD)"
+             file_sha="$(git -C gitops rev-parse HEAD:environments/dev/values.yaml)"
+
+             gh api "repos/${repository}/git/refs" \
+               --method POST \
+               -f ref="refs/heads/${branch}" \
+               -f sha="$base_sha" \
+               --silent
+
+             content="$(base64 -w 0 gitops/environments/dev/values.yaml)"
+
+             gh api "repos/${repository}/contents/environments/dev/values.yaml" \
+               --method PUT \
+               -f branch="$branch" \
+               -f sha="$file_sha" \
+               -f message="chore(dev): promote backend image ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+               -f content="$content" \
+               --silent
+
+             body="$(printf '%s\n' \
+               'Updates only the backend dev image digest.' \
+               '' \
+               "Image: 989200477899.dkr.ecr.us-east-2.amazonaws.com/dev-dealengine-ecr-repo@${IMAGE_DIGEST}" \
+               "Source commit: ${GITHUB_SHA}" \
+               "Build: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+               '' \
+               'Merging this PR triggers Argo auto-sync in dev.' \
+               'Verify this proposal is still the intended version; older runs may finish later.')"
+
+             url="$(gh api "repos/${repository}/pulls" \
+               --method POST \
+               -f base=main \
+               -f head="$branch" \
+               -f title="chore(dev): promote backend image ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+               -f body="$body" \
+               --jq '.html_url')"
+
+             printf 'GitOps proposal: %s\n' "$url" >> "$GITHUB_STEP_SUMMARY"

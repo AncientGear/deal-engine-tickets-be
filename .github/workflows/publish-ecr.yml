@@ -18,6 +18,10 @@ on:
       image-tag:
         required: true
         type: string
+    outputs:
+      image-digest:
+        description: "Published image manifest digest"
+        value: ${{ jobs.publish.outputs.image-digest }}
 
 permissions:
   contents: read
@@ -33,6 +37,8 @@ jobs:
       id-token: write
 
     steps:
+      - name: Checkout digest selector
+        uses: actions/checkout@v5
       - name: Download tested image
         uses: actions/download-artifact@v4
         with:
@@ -59,14 +65,29 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Push image
+        id: push
         env:
           REGISTRY: ${{ steps.login.outputs.registry }}
           REPOSITORY: ${{ inputs.repository }}
           IMAGE_TAG: ${{ inputs.image-tag }}
         run: |
-          image="${REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+          set -euo pipefail
+
+          repository="${REGISTRY}/${REPOSITORY}"
+          image="${repository}:${IMAGE_TAG}"
 
           docker tag deal-engine-backend:ci "$image"
           docker push "$image"
 
-          printf 'Published image: `%s`\n' "$image" >> "$GITHUB_STEP_SUMMARY"
+          digest="$(
+            docker image inspect "$image" \
+              --format '{{json .RepoDigests}}' |
+              python3 scripts/select_image_digest.py "$repository"
+          )"
+
+          printf 'image-digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+
+          printf 'Published image: `%s@%s` (tag: `%s`)\n' \
+            "$repository" "$digest" "$IMAGE_TAG" >> "$GITHUB_STEP_SUMMARY"
+    outputs:
+      image-digest: ${{ steps.push.outputs.image-digest }}

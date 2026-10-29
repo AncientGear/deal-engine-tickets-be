@@ -1,0 +1,132 @@
+name: Publish tested image to Floci
+
+on:
+  workflow_call:
+    inputs:
+      source-run-id:
+        required: true
+        type: string
+    secrets:
+      FLOCI_ACCESS_KEY_ID:
+        required: true
+      FLOCI_SECRET_ACCESS_KEY:
+        required: true
+    outputs:
+      image-digest:
+        description: Exact published manifest digest
+        value: ${{ jobs.publish.outputs.image-digest }}
+
+permissions:
+  contents: read
+  actions: read
+
+# Provision this label only on authorized lab runners; never run PR code.
+# Docker must trust/reach FLOCI_REGISTRY; the AWS CLI uses FLOCI_ENDPOINT_URL.
+# Pre-create an IMMUTABLE ECR repository. Floci policy/scanning/lifecycle
+# emulation is not a production security boundary. No public tunnel is needed.
+jobs:
+  publish:
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/dev'
+    runs-on: ${{ fromJSON('["self-hosted", "linux", "local-delivery"]') }}
+    timeout-minutes: 15
+    concurrency:
+      group: floci-backend-publish
+      cancel-in-progress: false
+    outputs:
+      image-digest: ${{ steps.push.outputs.image-digest }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_RUN_ID: ${{ inputs.source-run-id }}
+      FLOCI_ENDPOINT_URL: ${{ vars.FLOCI_ENDPOINT_URL }}
+      REGISTRY: ${{ vars.FLOCI_REGISTRY }}
+      REPOSITORY: ${{ vars.FLOCI_REPOSITORY }}
+      AWS_DEFAULT_REGION: ${{ vars.FLOCI_REGION || 'us-east-2' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.FLOCI_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.FLOCI_SECRET_ACCESS_KEY }}
+      AWS_EC2_METADATA_DISABLED: 'true'
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+      AWS_SESSION_TOKEN: ''
+      AWS_PAGER: ''
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate tested source run and local configuration
+        id: source
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$FLOCI_ENDPOINT_URL" =~ ^https?://[^[:space:]]+$ ]]
+          [[ "$REGISTRY" =~ ^[a-zA-Z0-9.-]+(:[0-9]+)?$ ]]
+          [[ "$REPOSITORY" =~ ^[a-z0-9]+([._/-][a-z0-9]+)*$ ]]
+          run="$(gh api "repos/${GH_REPO}/actions/runs/${SOURCE_RUN_ID}")"
+          artifact="$(printf '%s' "$run" | python3 -c '
+          import json, sys
+          r = json.load(sys.stdin)
+          assert r["path"] == ".github/workflows/ci.yml", "Not backend CI"
+          assert r["event"] == "push", "Not a push"
+          assert r["head_branch"] == "dev", "Not dev"
+          assert r["status"] == "completed", "CI incomplete"
+          assert r["conclusion"] == "success", "CI not successful"
+          print("backend-image-{}-{}".format(r["head_sha"], r["run_attempt"]))
+          ')"
+          printf 'artifact=%s\n' "$artifact" >> "$GITHUB_OUTPUT"
+
+      - name: Download tested image from validated CI run
+        uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.source-run-id }}
+          name: ${{ steps.source.outputs.artifact }}
+          path: >-
+            ${{ runner.temp }}/floci-image-${{ github.run_id }}-${{
+            github.run_attempt }}
+
+      - name: Publish immutable image and record digest
+        id: push
+        run: |
+          set -euo pipefail
+          # Unique tags avoid intentional replacement; server-side immutability
+          # is required as well, including for concurrent/non-GitHub clients.
+          tag="ci-${SOURCE_RUN_ID}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          image="${REGISTRY}/${REPOSITORY}:${tag}"
+          ecr() { aws --endpoint-url "$FLOCI_ENDPOINT_URL" ecr "$@"; }
+          mutability="$(ecr describe-repositories \
+            --repository-names "$REPOSITORY" \
+            --query 'repositories[0].imageTagMutability' --output text)"
+          [[ "$mutability" == IMMUTABLE ]]
+
+          # Isolate Docker credentials/cache from other self-hosted jobs.
+          export DOCKER_CONFIG
+          DOCKER_CONFIG="$(mktemp -d "${RUNNER_TEMP}/floci-docker.XXXXXX")"
+          trap 'docker logout "$REGISTRY" >/dev/null 2>&1 || true' EXIT
+          ecr get-login-password |
+            docker login --username AWS --password-stdin "$REGISTRY"
+          directory="floci-image-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker load --input "${RUNNER_TEMP}/${directory}/backend-image.tar"
+          platform="$(docker image inspect deal-engine-backend:ci \
+            --format '{{.Os}}/{{.Architecture}}')"
+          [[ "$platform" == linux/arm64 ]]
+          docker tag deal-engine-backend:ci "$image"
+          pushed="$(docker push "$image" 2>&1)"
+          printf '%s\n' "$pushed"
+          digest="$(printf '%s\n' "$pushed" | python3 -c '
+          import re, sys
+          pattern = r"digest: (sha256:[0-9a-f]{64})(?=\s|$)"
+          matches = re.findall(pattern, sys.stdin.read())
+          assert len(matches) == 1, "Expected one pushed manifest digest"
+          print(matches[0])
+          ')"
+          recorded="$(ecr describe-images --repository-name "$REPOSITORY" \
+            --image-ids "imageTag=${tag}" \
+            --query 'imageDetails[0].imageDigest' --output text)"
+          [[ "$recorded" == "$digest" ]]
+          printf 'image-digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'Published `%s/%s@%s` (CI run `%s`, linux/arm64)\n' \
+            "$REGISTRY" "$REPOSITORY" "$digest" "$SOURCE_RUN_ID" \
+            >> "$GITHUB_STEP_SUMMARY"

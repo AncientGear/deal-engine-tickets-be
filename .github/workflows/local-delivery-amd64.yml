@@ -1,0 +1,165 @@
+name: Local backend amd64 delivery
+
+# This workflow is only for the Docker Desktop amd64 laboratory.
+# The AWS CI and ARM64 Floci workflow are intentionally separate.
+on:
+  workflow_dispatch:
+    inputs:
+      ecr-endpoint:
+        description: Floci control-plane URL reachable by the runner
+        required: true
+        default: http://localhost:4566
+        type: string
+      registry:
+        description: Floci OCI registry host and port
+        required: true
+        default: 000000000000.dkr.ecr.us-east-2.localhost:4566
+        type: string
+      repository:
+        description: Existing immutable Floci repository
+        required: true
+        default: deal-engine/backend
+        type: string
+      aws-region:
+        description: Floci region
+        required: true
+        default: us-east-2
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ${{ fromJSON('["self-hosted", "linux", "local-delivery"]') }}
+    timeout-minutes: 30
+    concurrency:
+      group: floci-backend-amd64-publish
+      cancel-in-progress: false
+    env:
+      ECR_ENDPOINT: ${{ inputs.ecr-endpoint }}
+      REGISTRY: ${{ inputs.registry }}
+      REPOSITORY: ${{ inputs.repository }}
+      AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_EC2_METADATA_DISABLED: "true"
+      AWS_CONFIG_FILE: /dev/null
+      AWS_SHARED_CREDENTIALS_FILE: /dev/null
+      AWS_SESSION_TOKEN: ""
+      AWS_PAGER: ""
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out dev
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Validate runner and Floci repository
+        run: |
+          set -euo pipefail
+          [[ "$ECR_ENDPOINT" =~ ^https?://[^[:space:]]+$ ]]
+          [[ "$REGISTRY" =~ ^[a-zA-Z0-9.-]+(:[0-9]+)?$ ]]
+          [[ "$REPOSITORY" =~ ^[a-z0-9]+([._/-][a-z0-9]+)*$ ]]
+          test "$(uname -m)" = x86_64
+          aws --endpoint-url "$ECR_ENDPOINT" ecr describe-repositories \
+            --repository-names "$REPOSITORY" \
+            --query 'repositories[0].imageTagMutability' --output text \
+            | grep -qx IMMUTABLE
+
+      - name: Run Go tests
+        env:
+          GOPROXY: off
+          GOSUMDB: off
+        run: go test -count=1 ./...
+
+      - name: Start PostgreSQL for smoke test
+        run: |
+          set -euo pipefail
+          network=backend-local-ci
+          docker network create "$network" >/dev/null 2>&1 || true
+          docker run --detach --rm \
+            --name backend-local-postgres \
+            --network "$network" \
+            -e POSTGRES_USER=test \
+            -e POSTGRES_PASSWORD=ci-test-only \
+            -e POSTGRES_DB=tickets_test \
+            postgres:18
+          cleanup() {
+            docker rm -f backend-local-postgres backend-local-amd64 \
+              >/dev/null 2>&1 || true
+            docker network rm "$network" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          for attempt in {1..30}; do
+            if docker exec backend-local-postgres \
+              pg_isready -U test -d tickets_test >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec -i backend-local-postgres \
+            psql -U test -d tickets_test -v ON_ERROR_STOP=1 < 001_tickets.sql
+          docker exec -i backend-local-postgres \
+            psql -U test -d tickets_test -v ON_ERROR_STOP=1 < 002_admin.sql
+
+      - name: Build amd64 image
+        run: |
+          set -euo pipefail
+          image="$REGISTRY/$REPOSITORY:local-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          docker build --platform linux/amd64 --tag "$image" .
+          printf 'LOCAL_IMAGE=%s\n' "$image" >> "$GITHUB_ENV"
+
+      - name: Smoke test amd64 image
+        run: |
+          set -euo pipefail
+          database_url='postgres://test:ci-test-only@backend-local-postgres:5432/tickets_test?sslmode=disable'
+          docker run --detach \
+            --name backend-local-amd64 \
+            --network backend-local-ci \
+            -e LISTEN_ADDR=:8080 \
+            -e "DATABASE_URL=$database_url" \
+            -e TOKEN_SECRET='local-amd64-secret-not-for-production-32-bytes' \\
+            -e ENABLE_LOCAL_SETUP=false \
+            --publish 127.0.0.1:18080:8080 \
+            "$LOCAL_IMAGE"
+          ready=false
+          for attempt in {1..30}; do
+            if curl --fail --silent --show-error \
+              --connect-timeout 1 --max-time 2 \
+              http://127.0.0.1:18080/readyz; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          curl --fail --silent --show-error \
+            http://127.0.0.1:18080/metrics >/dev/null
+          test "$(docker image inspect "$LOCAL_IMAGE" \
+            --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
+
+      - name: Push and verify Floci digest
+        id: publish
+        run: |
+          set -euo pipefail
+          docker_config="$(mktemp -d "$RUNNER_TEMP/floci-docker.XXXXXX")"
+          export DOCKER_CONFIG="$docker_config"
+          trap 'docker logout "$REGISTRY" >/dev/null 2>&1 || true' EXIT
+          aws --endpoint-url "$ECR_ENDPOINT" ecr get-login-password \
+            | docker login --username AWS --password-stdin "$REGISTRY"
+          docker push "$LOCAL_IMAGE"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' \
+            "$LOCAL_IMAGE" | awk -F@ '{print $2}')"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          recorded="$(aws --endpoint-url "$ECR_ENDPOINT" ecr describe-images \
+            --repository-name "$REPOSITORY" \
+            --image-ids imageDigest="$digest" \
+            --query 'imageDetails[0].imageDigest' --output text)"
+          test "$recorded" = "$digest"
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'Published amd64 image: `%s@%s`\n' "$REGISTRY/$REPOSITORY" \
+            "$digest" >> "$GITHUB_STEP_SUMMARY"

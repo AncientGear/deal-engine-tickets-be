@@ -1,0 +1,22 @@
+name: Local backend delivery
+
+on:
+  workflow_dispatch:
+    inputs:
+      source-run-id:
+        description: Successful dev push Backend CI run ID (artifact must exist)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  publish:
+    uses: ./.github/workflows/publish-floci.yml
+    with:
+      source-run-id: ${{ inputs.source-run-id }}
+    secrets:
+      FLOCI_ACCESS_KEY_ID: ${{ secrets.FLOCI_ACCESS_KEY_ID }}
+      FLOCI_SECRET_ACCESS_KEY: ${{ secrets.FLOCI_SECRET_ACCESS_KEY }}

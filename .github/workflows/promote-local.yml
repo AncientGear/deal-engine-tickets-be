@@ -1,0 +1,123 @@
+name: Propose local GitOps promotion
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Local environment to promote
+        required: true
+        type: choice
+        options: [dev, staging, prod]
+      image-digest:
+        description: >-
+          Exact Floci manifest digest from a successful local publication
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  propose:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Validate promotion input
+        env:
+          IMAGE_DIGEST: ${{ inputs.image-digest }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+      - name: Create GitOps installation token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: AncientGear
+          repositories: dealengine-argo-ops
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Checkout GitOps main
+        uses: actions/checkout@v5
+        with:
+          repository: AncientGear/dealengine-argo-ops
+          ref: main
+          path: gitops
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Update only the selected local backend digest
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          IMAGE_DIGEST: ${{ inputs.image-digest }}
+        run: |
+          set -euo pipefail
+          case "$ENVIRONMENT" in
+            dev|staging|prod) ;;
+            *) echo 'Unsupported environment' >&2; exit 1 ;;
+          esac
+          values="gitops/environments/local/$ENVIRONMENT/backend-values.yaml"
+          test -f "$values"
+          IMAGE_DIGEST="$IMAGE_DIGEST" VALUES_FILE="$values" python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path(os.environ["VALUES_FILE"])
+          digest = os.environ["IMAGE_DIGEST"]
+          text = path.read_text(encoding="utf-8")
+          if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+              raise SystemExit("invalid image digest")
+          repository = (
+              "repository: 000000000000.dkr.ecr.us-east-2.localhost:4566/"
+              "deal-engine/backend"
+          )
+          if text.count(repository) != 1:
+              raise SystemExit("unexpected image repository")
+          digest_pattern = r"(?:\"\"|sha256:[0-9a-f]{64})"
+          matches = list(re.finditer(
+              r"(?m)^  digest: " + digest_pattern + r"$", text
+          ))
+          if len(matches) != 1:
+              raise SystemExit("expected exactly one image digest")
+          start, end = matches[0].span()
+          updated = text[:start] + f"  digest: {digest}" + text[end:]
+          path.write_text(updated, encoding="utf-8")
+          PY
+
+      - name: Open GitOps promotion PR
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          IMAGE_DIGEST: ${{ inputs.image-digest }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          repository=AncientGear/dealengine-argo-ops
+          if git -C gitops diff --quiet; then
+            echo 'Digest already selected; no PR required.'
+            exit 0
+          fi
+          expected_file="environments/local/$ENVIRONMENT/backend-values.yaml"
+          test "$(git -C gitops diff --name-only)" = "$expected_file"
+          branch="automation/local-${ENVIRONMENT}-backend-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          base_sha="$(git -C gitops rev-parse HEAD)"
+          file="environments/local/$ENVIRONMENT/backend-values.yaml"
+          file_sha="$(git -C gitops rev-parse "HEAD:$file")"
+          gh api "repos/$repository/git/refs" --method POST \
+            -f ref="refs/heads/$branch" -f sha="$base_sha" --silent
+          content="$(base64 -w 0 "gitops/$file")"
+          gh api "repos/$repository/contents/$file" --method PUT \
+            -f branch="$branch" -f sha="$file_sha" \
+            -f message="chore(local): promote backend to $ENVIRONMENT" \
+            -f content="$content" --silent
+          body="Promotes backend digest $IMAGE_DIGEST to local $ENVIRONMENT."
+          body+=" Source workflow commit: $SOURCE_SHA"
+          gh api "repos/$repository/pulls" --method POST \
+            -f base=main -f head="$branch" \
+            -f title="chore(local): promote backend to $ENVIRONMENT" \
+            -f body="$body" --jq '.html_url'

@@ -11,10 +11,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -97,6 +99,11 @@ func valid(t ticket) bool {
 }
 func (a *app) handler() http.Handler {
 	mux := http.NewServeMux()
+	metrics := &httpMetrics{
+		series: make(map[metricLabels]*metricValue),
+		logger: slog.New(slog.NewJSONHandler(os.Stdout, nil)),
+	}
+	mux.HandleFunc("GET /metrics", metrics.serve)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200); w.Write([]byte("ok")) })
 	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -282,8 +289,110 @@ func (a *app) handler() http.Handler {
 			http.Error(w, "method not allowed", 405)
 		}
 	})
-	return mux
+	return metrics.instrument(mux)
 }
+
+// Labels come only from registered patterns and a fixed method vocabulary.
+// No URL, query, header, or body data is retained.
+type metricLabels struct{ method, route, status string }
+type metricValue struct {
+	count   uint64
+	sum     float64
+	buckets [8]uint64
+}
+
+var durationBounds = [...]float64{.005, .01, .025, .05, .1, .5, 1, 5}
+
+type httpMetrics struct {
+	logger *slog.Logger
+	mu     sync.Mutex
+	series map[metricLabels]*metricValue
+}
+type metricWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *metricWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+func (w *metricWriter) WriteHeader(status int) {
+	if status >= 100 && status < 200 && status != 101 {
+		w.ResponseWriter.WriteHeader(status)
+		return
+	}
+	if w.status == 0 {
+		w.status = status
+		w.ResponseWriter.WriteHeader(status)
+	}
+}
+func (w *metricWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+func (m *httpMetrics) instrument(mux *http.ServeMux) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		writer := &metricWriter{ResponseWriter: w}
+		_, route := mux.Handler(r)
+		mux.ServeHTTP(writer, r)
+		if route == "" {
+			route = "unmatched"
+		}
+		if i := strings.IndexByte(route, ' '); i >= 0 {
+			route = route[i+1:]
+		}
+		method := r.Method
+		switch method {
+		case "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE":
+		default:
+			method = "OTHER"
+		}
+		status := writer.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		elapsed := time.Since(start).Seconds()
+		m.mu.Lock()
+		key := metricLabels{method, route, strconv.Itoa(status)}
+		v := m.series[key]
+		if v == nil {
+			v = &metricValue{}
+			m.series[key] = v
+		}
+		v.count++
+		v.sum += elapsed
+		for i, bound := range durationBounds {
+			if elapsed <= bound {
+				v.buckets[i]++
+			}
+		}
+		m.mu.Unlock()
+		if m.logger != nil {
+			m.logger.Info("http_request", "method", method, "route", route, "status", status, "duration_seconds", elapsed)
+		}
+	})
+}
+func (m *httpMetrics) serve(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	m.mu.Lock()
+	snapshot := make(map[metricLabels]metricValue, len(m.series))
+	for key, value := range m.series {
+		snapshot[key] = *value
+	}
+	m.mu.Unlock()
+	fmt.Fprintln(w, "# HELP http_requests_total Completed HTTP requests.\n# TYPE http_requests_total counter")
+	fmt.Fprintln(w, "# HELP http_request_duration_seconds HTTP request duration in seconds.\n# TYPE http_request_duration_seconds histogram")
+	for key, v := range snapshot {
+		labels := fmt.Sprintf("method=%q,route=%q,status=%q", key.method, key.route, key.status)
+		fmt.Fprintf(w, "http_requests_total{%s} %d\n", labels, v.count)
+		for i, bound := range durationBounds {
+			fmt.Fprintf(w, "http_request_duration_seconds_bucket{%s,le=%q} %d\n", labels, strconv.FormatFloat(bound, 'g', -1, 64), v.buckets[i])
+		}
+		fmt.Fprintf(w, "http_request_duration_seconds_bucket{%s,le=\"+Inf\"} %d\nhttp_request_duration_seconds_sum{%s} %g\nhttp_request_duration_seconds_count{%s} %d\n", labels, v.count, labels, v.sum, labels, v.count)
+	}
+}
+
 func listenAddress(configured string) string {
 	if configured == "" {
 		return ":8080"

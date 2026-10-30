@@ -86,7 +86,7 @@ jobs:
             --network "$network" \
             -e POSTGRES_USER=test \
             -e POSTGRES_PASSWORD=ci-test-only \
-            -e POSTGRES_DB=tickets_test \
+            -e POSTGRES_DB=postgres \
             postgres:18
           cleanup() {
             docker rm -f backend-local-postgres backend-local-amd64 \
@@ -94,13 +94,20 @@ jobs:
             docker network rm "$network" >/dev/null 2>&1 || true
           }
           trap cleanup EXIT
+          ready=false
           for attempt in {1..30}; do
             if docker exec backend-local-postgres \
-              pg_isready -U test -d tickets_test >/dev/null 2>&1; then
+              psql -U test -d postgres -tAc 'SELECT 1' \
+              >/dev/null 2>&1; then
+              ready=true
               break
             fi
             sleep 1
           done
+          test "$ready" = true
+          docker exec backend-local-postgres \
+            psql -U test -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE tickets_test'
           docker exec -i backend-local-postgres \
             psql -U test -d tickets_test -v ON_ERROR_STOP=1 < 001_tickets.sql
           docker exec -i backend-local-postgres \
@@ -122,7 +129,7 @@ jobs:
             --network backend-local-ci \
             -e LISTEN_ADDR=:8080 \
             -e "DATABASE_URL=$database_url" \
-            -e TOKEN_SECRET='local-amd64-secret-not-for-production-32-bytes' \\
+            -e TOKEN_SECRET='local-amd64-secret-not-for-production-32-bytes' \
             -e ENABLE_LOCAL_SETUP=false \
             --publish 127.0.0.1:18080:8080 \
             "$LOCAL_IMAGE"

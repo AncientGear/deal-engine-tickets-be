@@ -124,8 +124,10 @@ jobs:
         run: |
           set -euo pipefail
           image="$IMAGE_REPOSITORY:$IMAGE_TAG"
+          image_archive="$RUNNER_TEMP/backend-amd64-image.tar"
           docker build --platform linux/amd64 --tag "$image" .
           docker image inspect "$image" >/dev/null
+          docker save --output "$image_archive" "$image"
 
       - name: Smoke test amd64 image
         run: |
@@ -165,6 +167,8 @@ jobs:
         run: |
           set -euo pipefail
           image="$IMAGE_REPOSITORY:$IMAGE_TAG"
+          image_archive="$RUNNER_TEMP/backend-amd64-image.tar"
+          docker load --input "$image_archive"
           docker_config="$(mktemp -d "$RUNNER_TEMP/floci-docker.XXXXXX")"
           export DOCKER_CONFIG="$docker_config"
           trap 'docker logout "$REGISTRY" >/dev/null 2>&1 || true' EXIT

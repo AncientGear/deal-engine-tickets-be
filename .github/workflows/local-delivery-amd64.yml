@@ -13,7 +13,7 @@ on:
       registry:
         description: Floci OCI registry host and port
         required: true
-        default: 000000000000.dkr.ecr.us-east-2.localhost:4566
+        default: 000000000000.dkr.ecr.us-east-2.localhost:5100
         type: string
       repository:
         description: Existing immutable Floci repository
@@ -49,6 +49,7 @@ jobs:
       AWS_SHARED_CREDENTIALS_FILE: /dev/null
       AWS_SESSION_TOKEN: ""
       AWS_PAGER: ""
+      RESOURCE_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
     defaults:
       run:
         shell: bash
@@ -79,10 +80,11 @@ jobs:
       - name: Start PostgreSQL for smoke test
         run: |
           set -euo pipefail
-          network=backend-local-ci
+          network="backend-local-ci-$RESOURCE_SUFFIX"
+          postgres_container="backend-local-postgres-$RESOURCE_SUFFIX"
           docker network create "$network" >/dev/null 2>&1 || true
           docker run --detach --rm \
-            --name backend-local-postgres \
+            --name "$postgres_container" \
             --network "$network" \
             -e POSTGRES_USER=test \
             -e POSTGRES_PASSWORD=ci-test-only \
@@ -90,7 +92,7 @@ jobs:
             postgres:18
           ready=false
           for attempt in {1..30}; do
-            if docker exec backend-local-postgres \
+            if docker exec "$postgres_container" \
               psql -U test -d postgres -tAc 'SELECT 1' \
               >/dev/null 2>&1; then
               ready=true
@@ -99,12 +101,12 @@ jobs:
             sleep 1
           done
           test "$ready" = true
-          docker exec backend-local-postgres \
+          docker exec "$postgres_container" \
             psql -U test -d postgres -v ON_ERROR_STOP=1 \
             -c 'CREATE DATABASE tickets_test'
-          docker exec -i backend-local-postgres \
+          docker exec -i "$postgres_container" \
             psql -U test -d tickets_test -v ON_ERROR_STOP=1 < 001_tickets.sql
-          docker exec -i backend-local-postgres \
+          docker exec -i "$postgres_container" \
             psql -U test -d tickets_test -v ON_ERROR_STOP=1 < 002_admin.sql
 
       - name: Build amd64 image
@@ -117,10 +119,13 @@ jobs:
       - name: Smoke test amd64 image
         run: |
           set -euo pipefail
-          database_url='postgres://test:ci-test-only@backend-local-postgres:5432/tickets_test?sslmode=disable'
+          network="backend-local-ci-$RESOURCE_SUFFIX"
+          postgres_container="backend-local-postgres-$RESOURCE_SUFFIX"
+          backend_container="backend-local-amd64-$RESOURCE_SUFFIX"
+          database_url="postgres://test:ci-test-only@${postgres_container}:5432/tickets_test?sslmode=disable"
           docker run --detach \
-            --name backend-local-amd64 \
-            --network backend-local-ci \
+            --name "$backend_container" \
+            --network "$network" \
             -e LISTEN_ADDR=:8080 \
             -e "DATABASE_URL=$database_url" \
             -e TOKEN_SECRET='local-amd64-secret-not-for-production-32-bytes' \
@@ -168,6 +173,9 @@ jobs:
       - name: Clean up local smoke-test resources
         if: always()
         run: |
-          docker rm -f backend-local-postgres backend-local-amd64 \
+          network="backend-local-ci-$RESOURCE_SUFFIX"
+          postgres_container="backend-local-postgres-$RESOURCE_SUFFIX"
+          backend_container="backend-local-amd64-$RESOURCE_SUFFIX"
+          docker rm -f "$postgres_container" "$backend_container" \
             >/dev/null 2>&1 || true
-          docker network rm backend-local-ci >/dev/null 2>&1 || true
+          docker network rm "$network" >/dev/null 2>&1 || true

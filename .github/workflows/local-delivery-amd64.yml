@@ -50,6 +50,9 @@ jobs:
       AWS_SESSION_TOKEN: ""
       AWS_PAGER: ""
       RESOURCE_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
+      IMAGE_REPOSITORY: ${{ inputs.registry }}/${{ inputs.repository }}
+      IMAGE_TAG: >-
+        local-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
     defaults:
       run:
         shell: bash
@@ -120,9 +123,9 @@ jobs:
       - name: Build amd64 image
         run: |
           set -euo pipefail
-          image="$REGISTRY/$REPOSITORY:local-$GITHUB_SHA-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          image="$IMAGE_REPOSITORY:$IMAGE_TAG"
           docker build --platform linux/amd64 --tag "$image" .
-          printf 'LOCAL_IMAGE=%s\n' "$image" >> "$GITHUB_ENV"
+          docker image inspect "$image" >/dev/null
 
       - name: Smoke test amd64 image
         run: |
@@ -130,6 +133,7 @@ jobs:
           network="backend-local-ci-$RESOURCE_SUFFIX"
           postgres_container="backend-local-postgres-$RESOURCE_SUFFIX"
           backend_container="backend-local-amd64-$RESOURCE_SUFFIX"
+          image="$IMAGE_REPOSITORY:$IMAGE_TAG"
           database_url="postgres://test:ci-test-only@${postgres_container}:5432/tickets_test?sslmode=disable"
           docker run --detach \
             --name "$backend_container" \
@@ -139,7 +143,7 @@ jobs:
             -e TOKEN_SECRET='local-amd64-secret-not-for-production-32-bytes' \
             -e ENABLE_LOCAL_SETUP=false \
             --publish 127.0.0.1:18080:8080 \
-            "$LOCAL_IMAGE"
+            "$image"
           ready=false
           for attempt in {1..30}; do
             if curl --fail --silent --show-error \
@@ -153,21 +157,23 @@ jobs:
           test "$ready" = true
           curl --fail --silent --show-error \
             http://127.0.0.1:18080/metrics >/dev/null
-          test "$(docker image inspect "$LOCAL_IMAGE" \
+          test "$(docker image inspect "$image" \
             --format '{{.Os}}/{{.Architecture}}')" = linux/amd64
 
       - name: Push and verify Floci digest
         id: publish
         run: |
           set -euo pipefail
+          image="$IMAGE_REPOSITORY:$IMAGE_TAG"
           docker_config="$(mktemp -d "$RUNNER_TEMP/floci-docker.XXXXXX")"
           export DOCKER_CONFIG="$docker_config"
           trap 'docker logout "$REGISTRY" >/dev/null 2>&1 || true' EXIT
           aws --endpoint-url "$ECR_ENDPOINT" ecr get-login-password \
             | docker login --username AWS --password-stdin "$REGISTRY"
-          docker push "$LOCAL_IMAGE"
+          docker image inspect "$image" >/dev/null
+          docker push "$image"
           digest="$(docker inspect --format '{{index .RepoDigests 0}}' \
-            "$LOCAL_IMAGE" | awk -F@ '{print $2}')"
+            "$image" | awk -F@ '{print $2}')"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           recorded="$(aws --endpoint-url "$ECR_ENDPOINT" ecr describe-images \
             --repository-name "$REPOSITORY" \

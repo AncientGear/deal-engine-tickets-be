@@ -88,12 +88,6 @@ jobs:
             -e POSTGRES_PASSWORD=ci-test-only \
             -e POSTGRES_DB=postgres \
             postgres:18
-          cleanup() {
-            docker rm -f backend-local-postgres backend-local-amd64 \
-              >/dev/null 2>&1 || true
-            docker network rm "$network" >/dev/null 2>&1 || true
-          }
-          trap cleanup EXIT
           ready=false
           for attempt in {1..30}; do
             if docker exec backend-local-postgres \
@@ -170,3 +164,10 @@ jobs:
           printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
           printf 'Published amd64 image: `%s@%s`\n' "$REGISTRY/$REPOSITORY" \
             "$digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up local smoke-test resources
+        if: always()
+        run: |
+          docker rm -f backend-local-postgres backend-local-amd64 \
+            >/dev/null 2>&1 || true
+          docker network rm backend-local-ci >/dev/null 2>&1 || true

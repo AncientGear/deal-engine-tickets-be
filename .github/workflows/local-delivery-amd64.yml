@@ -93,21 +93,29 @@ jobs:
           ready=false
           for attempt in {1..30}; do
             if docker exec "$postgres_container" \
-              psql -U test -d postgres -tAc 'SELECT 1' \
+              pg_isready -h 127.0.0.1 -U test -d postgres \
+              >/dev/null 2>&1 && \
+              docker exec "$postgres_container" \
+              psql -h 127.0.0.1 -U test -d postgres -tAc 'SELECT 1' \
               >/dev/null 2>&1; then
               ready=true
               break
             fi
             sleep 1
           done
-          test "$ready" = true
+          if [[ "$ready" != true ]]; then
+            docker logs "$postgres_container" || true
+            exit 1
+          fi
           docker exec "$postgres_container" \
-            psql -U test -d postgres -v ON_ERROR_STOP=1 \
+            psql -h 127.0.0.1 -U test -d postgres -v ON_ERROR_STOP=1 \
             -c 'CREATE DATABASE tickets_test'
           docker exec -i "$postgres_container" \
-            psql -U test -d tickets_test -v ON_ERROR_STOP=1 < 001_tickets.sql
+            psql -h 127.0.0.1 -U test -d tickets_test -v ON_ERROR_STOP=1 \
+            < 001_tickets.sql
           docker exec -i "$postgres_container" \
-            psql -U test -d tickets_test -v ON_ERROR_STOP=1 < 002_admin.sql
+            psql -h 127.0.0.1 -U test -d tickets_test -v ON_ERROR_STOP=1 \
+            < 002_admin.sql
 
       - name: Build amd64 image
         run: |

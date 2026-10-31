@@ -170,6 +170,11 @@ jobs:
           image="$IMAGE_REPOSITORY:$IMAGE_TAG"
           image_archive="$RUNNER_TEMP/backend-amd64-image.tar"
           docker load --input "$image_archive"
+          docker_context="$(docker context show)"
+          docker_host="$(docker context inspect "$docker_context" \
+            --format '{{.Endpoints.docker.Host}}')"
+          test -n "$docker_host"
+          export DOCKER_HOST="$docker_host"
           docker_config="$(mktemp -d "$RUNNER_TEMP/floci-docker.XXXXXX")"
           export DOCKER_CONFIG="$docker_config"
           trap 'docker logout "$REGISTRY" >/dev/null 2>&1 || true' EXIT
